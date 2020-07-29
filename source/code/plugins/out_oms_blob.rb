@@ -133,6 +133,7 @@ module Fluent
       extra_headers = {
         OMS::CaseSensitiveString.new('x-ms-client-request-retry-count') => "#{@num_errors}"
       }
+      @log.trace("[#{Thread.current.object_id}] request_blob_json url=#{OMS::Configuration.get_blob_ods_endpoint.path}")
       req = OMS::Common.create_ods_request(OMS::Configuration.get_blob_ods_endpoint.path, data, compress=false, extra_headers)
 
       ods_http = OMS::Common.create_ods_http(OMS::Configuration.get_blob_ods_endpoint, @proxy_config)
@@ -223,6 +224,7 @@ module Fluent
       request_id = SecureRandom.uuid
       append_uri = URI.parse("#{uri.to_s}&comp=block&blockid=#{base64_blockid}")
 
+      @log.trace("[#{Thread.current.object_id}] upload_block: url=#{append_uri}")
       put_block_req = create_blob_put_request(append_uri, msg, request_id, nil)
       http = OMS::Common.create_secure_http(append_uri, @proxy_config)
       OMS::Common.start_request(put_block_req, http)
@@ -246,6 +248,7 @@ module Fluent
 
       blocklist_uri = URI.parse("#{uri.to_s}&comp=blocklist")
       request_id = SecureRandom.uuid
+      @log.trace("[#{Thread.current.object_id}] commit_blocks: url=#{blocklist_uri}, request_id=#{request_id} blocks_uncommitted=#{blocks_uncommitted} blocks_committed(#{blocks_committed.length()})=#{blocks_committed}")
       put_blocklist_req = create_blob_put_request(blocklist_uri, commit_msg, request_id, file_path)
       http = OMS::Common.create_secure_http(blocklist_uri, @proxy_config)
       response = OMS::Common.start_request(put_blocklist_req, http, ignore404 = false, return_entire_response = true)
@@ -348,32 +351,31 @@ module Fluent
         raise "The tag does not have at least 4 parts #{tag}"
       end
 
-      start = Time.now
-      blob_uri, blocks_committed, blob_size = get_blob_uri_and_committed_blocks(container_type, data_type, custom_data_type, suffix)
-      time = Time.now - start
-      @log.debug "Success getting the BLOB information in #{time.round(3)}s"
+      # get a lock before getting the blob information and blob append to avoid 400 http
+      # storage errors when mltiple threads are writing to the same blob (same tag)
+      @log.trace "[#{Thread.current.object_id}] Trying to enter critical section before append_blob()"
+      BlockLock.lock
+      begin
+        start = Time.now
+        blob_uri, blocks_committed, blob_size = get_blob_uri_and_committed_blocks(container_type, data_type, custom_data_type, suffix)
+        time = Time.now - start
+        @log.debug "[#{Thread.current.object_id}] Success getting the BLOB information in #{time.round(3)}s"
 
-      start = Time.now
+        start = Time.now
 
-      if @num_threads > 1
-        # get a lock for the blob append to avoid storage errors when parallel threads are writing
-        BlockLock.lock
-        begin
-          dataSize, etag = append_blob(blob_uri, records, filePath, blocks_committed)
-        ensure
-          BlockLock.unlock
-        end
-      else
+        @log.trace "[#{Thread.current.object_id}] entering critical section before append_blob()"
         dataSize, etag = append_blob(blob_uri, records, filePath, blocks_committed)
+        time = Time.now - start
+        @log.debug "[#{Thread.current.object_id}] Success sending #{dataSize} bytes of data to BLOB #{time.round(3)}s"
+        @log.trace "[#{Thread.current.object_id}] finish append_blob()"
+      ensure
+        BlockLock.unlock
       end
-
-      time = Time.now - start
-      @log.debug "Success sending #{dataSize} bytes of data to BLOB #{time.round(3)}s"
 
       start = Time.now
       notify_blob_upload_complete(blob_uri, data_type, custom_data_type, blob_size, dataSize, etag)
       time = Time.now - start
-      @log.trace "Success notify the data to BLOB #{time.round(3)}s"
+      @log.trace "[#{Thread.current.object_id}] Success notify the data to BLOB #{time.round(3)}s"
       write_status_file("true","Sending success")
       return OMS::Telemetry.push_qos_event(OMS::SEND_BATCH, "true", "", tag, records, records.size, time)
     rescue OMS::RetryRequestException => e
@@ -382,7 +384,7 @@ module Fluent
       write_status_file("false", "Retryable exception")
       # Re-raise the exception to inform the fluentd engine we want to retry sending this chunk of data later.
       # it must be generic exception, otherwise, fluentd will stuck.
-      raise e.message
+      raise e
     rescue => e
       msg = "Unexpected exception, dropping data. Error:'#{e}'"
       OMS::Log.error_once(msg)
